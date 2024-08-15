@@ -19,6 +19,8 @@ class BlockBSpeedEstimator(nn.Module):
             return self.estimateByChannelNum(x)
         elif self.type == 'mask':
             return self.estimateByMask(x)
+        else:
+            assert None, 'unknown block type'
 
     @torch.no_grad()
     def estimateByModuleChannel(self, module: nn.Module):

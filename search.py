@@ -16,7 +16,7 @@ import common.meters
 import common.modes
 import common.metrics
 
-from utils.estimate import test
+from utils.estimate import test, inference
 from utils import logging_tool
 from collections import OrderedDict
 
@@ -26,6 +26,8 @@ from utils import attr_extractor, loss_printer, SpeedScheduler
 from loss_config import update_weight
 from speed_models import get_ori_speed
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+import cv2
 
 warnings.simplefilter("ignore", UserWarning)
 
@@ -179,7 +181,115 @@ def trainer_preparation(model, learning_rate, epochs, type="Adam"):
     return optimizer, scheduler
 
 
-def main(params, logging):
+def main_inference(params, logging):
+    logging.info('[MODE] Inference..')
+    logging.info(f"Using GPU:0")
+
+    # Enable cudnn Optimization for static network structure
+    torch.backends.cudnn.benchmark = True
+
+    params.world_size = 1
+
+    # Set device
+    device = 0
+    update_weight(params=params)
+    logging.info(attr_extractor(params), device=device)
+
+    # Create job and tb_writer
+    writer = SummaryWriter(params.job_dir) if device == 0 else None
+
+    if params.debug:
+        logging.info('Enable anomaly detect', device=device)
+        logging.warning('Debug mode is super slow, set epochs to 1', device=device)
+        params.epochs = 1
+        torch.autograd.set_detect_anomaly(params.debug)
+
+    # Create Model
+
+    params.num_blocks = 16
+    params.num_residual_units = 24
+    params.speed_target = 100
+    params.width_epochs = 10
+    params.scales = 2
+
+    params.width_epochs = 10
+    params.epochs = 20
+
+    params.speed_target = 100  # target latency in ms
+
+    params.width_epochs = 10  # width only search epoch
+    params.epochs = 20  # width+depth search epoch
+    params.finetune_epochs = 30  # fine-tune epoch
+    params.num_patches = 1000  # default 1000
+    params.train_batch_size = 16  # default 16
+    params.lr_patch_size = 48  # default 48
+
+    # arch
+    params.scale = 2
+    params.num_blocks = 16
+    params.num_residual_units = 24
+
+    params.width_search = True
+
+    model = models.get_model(params=params)
+    logging.info(f"\n{model}", is_print=False, device=device)
+
+    logging.info(f"Set speed weight to {params.weight_speed}", device=device)
+
+    # Loss function
+    criterions = OrderedDict()
+    criterions['l1'] = nn.L1Loss().to(device)
+
+    ori_speed = get_ori_speed(num_blocks=params.num_blocks, num_residual_units=params.num_residual_units)
+    logging.info(f'Supernet Speed: {ori_speed:.02f} ms', device=device)
+    logging.info(f'Target Speed: {params.speed_target:.02f} ms', device=device)
+    criterions['speed'] = SpeedLoss(scale=ori_speed - params.speed_target).to(device)
+
+    if not params.width_search:
+        params.width_epochs = 0
+
+    params.job_dir = 'inference'
+
+    if device == 0:
+        for folder in ['results', 'weights', 'ckpt', 'eval']:
+            folder_path = os.path.join(params.job_dir, folder)
+            if os.path.exists(folder_path):
+                logging.warning(f'{os.path.join(params.job_dir, folder)} already exists', device=device)
+            else:
+                os.mkdir(folder_path)
+                logging.info(f'Create {folder_path}', device=device)
+
+    # Train
+    logging.info('*****before to device')
+    model.to(torch.device(device))
+    logging.info('*****before capture')
+    inference_video_path = params.inference_video
+    cap = cv2.VideoCapture(inference_video_path)
+    frame_list = []
+    cnt = 0
+    logging.info('*****before read')
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+        resized_img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = torch.from_numpy(resized_img_rgb).div(255.0).unsqueeze(0)
+        frame = frame.permute(0, 3, 1, 2)
+
+        frame_list.append(frame)
+        cnt += 1
+    logging.info('*****after read')
+
+    delay_acc, _ = inference(frame_list, model, gpu=torch.device(device), logger=logging)
+
+    if device == 0:
+        writer.close()
+
+    logging.info(f"Finish Inference..", device=device)
+
+
+def main_train(params, logging):
+    logging.info('[MODE] Inference..')
     logging.info(f"Using GPU:{os.environ['CUDA_VISIBLE_DEVICES']}")
     dataset_module = importlib.import_module(f'datasets.{params.dataset}' if params.dataset else 'datasets')
 
@@ -408,17 +518,24 @@ def main(params, logging):
     logging.info(f"Finish Training", device=device)
 
 
+def main(params, logging):
+    if params.is_train:
+        main_train(params, logging)
+    else:
+        main_inference(params, logging)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', default='NAS_MODEL', type=str, required=True,
+    parser.add_argument('--model_type', default='NAS_MODEL', type=str,
                         help='model type: NAS_MODEL / BASIC_MODEL')
-    parser.add_argument('--dataset', default=None, type=str, required=True,
+    parser.add_argument('--dataset', default=None, type=str,
                         help='Dataset name.')
-    parser.add_argument('--job_dir', default=None, type=str, required=True,
+    parser.add_argument('--job_dir', default='inference', type=str,
                         help='Directory to write checkpoints and export models.')
     parser.add_argument('--ckpt', default=None, type=str,
                         help='File path to load checkpoint.')
-    parser.add_argument('--model_weight', default=None, type=str,
+    parser.add_argument('--model_weight', default='models/pretrained/weights/wdsr_b_x2_16_24.pt', type=str,
                         help='path to weight')
     parser.add_argument('--scheduler_type', default='multi_step', type=str,
                         help="LR scheduler type: cosine, multi_step")
@@ -451,6 +568,15 @@ if __name__ == '__main__':
                         help='resume training from ckpt')
     parser.add_argument('--warmup_lr', default=False, action='store_true',
                         help='Using warmup lr')
+
+    parser.add_argument('--is_train', default=False, action='store_true',
+                        help='train/inference')
+    parser.add_argument('--inference_video', default='road.mp4', type=str,
+                        help='inference video path')
+    parser.add_argument('--image_mean', default=0, type=float,
+                        help='')
+    parser.add_argument('--num_channels', default=3, type=int,
+                        help='')
 
     # Verbose
     parser.add_argument('-v', '--verbose', action='count', default=1,
